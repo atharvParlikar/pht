@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"sync"
 	// "github.com/Masterminds/semver/v3"
 	"io"
 	"net/http"
@@ -43,17 +44,7 @@ func getDependencies(packageName string, version string) (map[string]string, err
 	return depResponse.Dependencies, nil
 }
 
-func downloadPackage(packageName string, version string) {
-	_, exists := os.Stat("node_modules")
-
-	if os.IsNotExist(exists) {
-		err := os.Mkdir("node_modules", 0755)
-		if err != nil {
-			fmt.Println("[ERROR] ", err)
-			return
-		}
-	}
-
+func downloadPackage(packageName string, version string, wg *sync.WaitGroup, ch chan string) {
 	err := os.Mkdir("node_modules/"+packageName, 0755)
 	if err != nil {
 		fmt.Println("[ERROR] ", err)
@@ -128,6 +119,9 @@ func downloadPackage(packageName string, version string) {
 			return
 		}
 	}
+
+	ch <- packageName
+	wg.Done()
 }
 
 func dependencyTree(packageName string, version string) (map[string]string, error) {
@@ -152,7 +146,45 @@ func dependencyTree(packageName string, version string) (map[string]string, erro
 	return depTree, nil
 }
 
+func dependencyTreeMT(packageName string, version string) (map[string]string, error) {
+	depTree := map[string]string{}
+	depTreeMutex := sync.Mutex{}
+	var wg sync.WaitGroup
+
+	var recursiveSearch func(packageName string, version string)
+	recursiveSearch = func(packageName string, version string) {
+		defer wg.Done()
+
+		deps, err := getDependencies(packageName, version)
+		if err != nil {
+			fmt.Println("[ERROR] ", err)
+			return
+		}
+
+		if len(deps) > 0 {
+			for package_, version := range deps {
+				depTreeMutex.Lock()
+				if _, exists := depTree[package_]; !exists {
+					depTree[package_] = version
+					wg.Add(1)
+					go recursiveSearch(package_, extractSemver(version))
+				}
+				depTreeMutex.Unlock()
+			}
+		}
+	}
+
+	wg.Add(1)
+	go recursiveSearch(packageName, version)
+	wg.Wait()
+
+	return depTree, nil
+}
+
 func extractSemver(input string) string {
+	if input == "latest" {
+		return input
+	}
 	regexpPattern := "([0-9]+\\.[0-9]+\\.[0-9]+)"
 	re := regexp.MustCompile(regexpPattern)
 	match := re.FindString(input)
@@ -160,26 +192,33 @@ func extractSemver(input string) string {
 	return match
 }
 
-func main() {
-	// downloadPackage("express", "4.18.2")
-	start := time.Now()
-	depTree, err := dependencyTree("express", "latest")
+func downloadPackageFull(pkgName string, version string) {
+	depTree, err := dependencyTreeMT(pkgName, extractSemver(version))
 
 	if err != nil {
 		fmt.Println("[ERROR] ", err)
-		return
 	}
 
-	elapsed := time.Since(start)
+	var wg sync.WaitGroup
+	ch := make(chan string)
 
-	fmt.Println("Dep Tree generation time: ", elapsed.Seconds())
-
-	start = time.Now()
-
-	for package_, version := range depTree {
-		downloadPackage(package_, extractSemver(version))
-		fmt.Printf("%s@%s Installed!\n", package_, extractSemver(version))
+	for package_, ver := range depTree {
+		wg.Add(1)
+		go downloadPackage(package_, extractSemver(ver), &wg, ch)
 	}
 
-	fmt.Println("Time to install express: ", elapsed.Seconds())
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	for pkgName := range ch {
+		fmt.Println("Finished installing: ", pkgName)
+	}
+}
+
+func main() {
+	start := time.Now()
+	downloadPackageFull("express", "latest")
+	fmt.Println("Time taken: ", time.Since(start).Seconds())
 }
